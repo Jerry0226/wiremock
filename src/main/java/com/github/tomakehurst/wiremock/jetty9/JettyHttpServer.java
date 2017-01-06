@@ -18,32 +18,29 @@ package com.github.tomakehurst.wiremock.jetty9;
 import static com.github.tomakehurst.wiremock.common.Exceptions.throwUnchecked;
 import static com.github.tomakehurst.wiremock.core.WireMockApp.ADMIN_CONTEXT_ROOT;
 
+import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.util.EnumSet;
 
 import javax.servlet.DispatcherType;
 
+import com.github.tomakehurst.wiremock.common.*;
+import com.github.tomakehurst.wiremock.core.WireMockApp;
+import com.github.tomakehurst.wiremock.http.trafficlistener.WiremockNetworkTrafficListener;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.io.Resources;
 import org.eclipse.jetty.http.MimeTypes;
-import org.eclipse.jetty.server.ConnectionFactory;
-import org.eclipse.jetty.server.Handler;
-import org.eclipse.jetty.server.HttpConfiguration;
-import org.eclipse.jetty.server.HttpConnectionFactory;
-import org.eclipse.jetty.server.SecureRequestCustomizer;
-import org.eclipse.jetty.server.Server;
-import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.server.SslConnectionFactory;
+import org.eclipse.jetty.io.NetworkTrafficListener;
+import org.eclipse.jetty.server.*;
 import org.eclipse.jetty.server.handler.HandlerCollection;
 import org.eclipse.jetty.servlet.DefaultServlet;
+import org.eclipse.jetty.servlet.FilterHolder;
 import org.eclipse.jetty.servlet.ServletContextHandler;
 import org.eclipse.jetty.servlet.ServletHolder;
+import org.eclipse.jetty.servlets.CrossOriginFilter;
 import org.eclipse.jetty.servlets.GzipFilter;
-import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.eclipse.jetty.util.thread.QueuedThreadPool;
 
-import com.github.tomakehurst.wiremock.WireMockServer;
-import com.github.tomakehurst.wiremock.common.FileSource;
-import com.github.tomakehurst.wiremock.common.HttpsSettings;
-import com.github.tomakehurst.wiremock.common.JettySettings;
-import com.github.tomakehurst.wiremock.common.Notifier;
 import com.github.tomakehurst.wiremock.core.Options;
 import com.github.tomakehurst.wiremock.http.AdminRequestHandler;
 import com.github.tomakehurst.wiremock.http.HttpServer;
@@ -56,7 +53,7 @@ import com.github.tomakehurst.wiremock.servlet.WireMockHandlerDispatchingServlet
 
 class JettyHttpServer implements HttpServer {
 
-    private static final String FILES_URL_MATCH = String.format("/%s/*", WireMockServer.FILES_ROOT);
+    private static final String FILES_URL_MATCH = String.format("/%s/*", WireMockApp.FILES_ROOT);
 
     private final Server jettyServer;
     private final ServerConnector httpConnector;
@@ -67,21 +64,23 @@ class JettyHttpServer implements HttpServer {
             AdminRequestHandler adminRequestHandler,
             StubRequestHandler stubRequestHandler
     ) {
-
         QueuedThreadPool threadPool = new QueuedThreadPool(options.containerThreads());
         jettyServer = new Server(threadPool);
 
+        NetworkTrafficListenerAdapter networkTrafficListenerAdapter = new NetworkTrafficListenerAdapter(options.networkTrafficListener());
         httpConnector = createHttpConnector(
                 options.bindAddress(),
                 options.portNumber(),
-                options.jettySettings()
+                options.jettySettings(),
+                networkTrafficListenerAdapter
         );
         jettyServer.addConnector(httpConnector);
 
         if (options.httpsSettings().enabled()) {
             httpsConnector = createHttpsConnector(
                     options.httpsSettings(),
-                    options.jettySettings());
+                    options.jettySettings(),
+                    networkTrafficListenerAdapter);
             jettyServer.addConnector(httpsConnector);
         } else {
             httpsConnector = null;
@@ -153,13 +152,15 @@ class JettyHttpServer implements HttpServer {
     private ServerConnector createHttpConnector(
             String bindAddress,
             int port,
-            JettySettings jettySettings) {
+            JettySettings jettySettings,
+            NetworkTrafficListener listener) {
 
         HttpConfiguration httpConfig = createHttpConfig(jettySettings);
 
         ServerConnector connector = createServerConnector(
                 jettySettings,
                 port,
+                listener,
                 new HttpConnectionFactory(httpConfig)
         );
         connector.setHost(bindAddress);
@@ -168,7 +169,8 @@ class JettyHttpServer implements HttpServer {
 
     private ServerConnector createHttpsConnector(
             HttpsSettings httpsSettings,
-            JettySettings jettySettings) {
+            JettySettings jettySettings,
+            NetworkTrafficListener listener) {
 
         //Added to support Android https communication.
         CustomizedSslContextFactory sslContextFactory = new CustomizedSslContextFactory();
@@ -192,6 +194,7 @@ class JettyHttpServer implements HttpServer {
         return createServerConnector(
                 jettySettings,
                 port,
+                listener,
                 new SslConnectionFactory(
                         sslContextFactory,
                         "http/1.1"
@@ -209,9 +212,9 @@ class JettyHttpServer implements HttpServer {
         return httpConfig;
     }
 
-    private ServerConnector createServerConnector(JettySettings jettySettings, int port, ConnectionFactory... connectionFactories) {
+    private ServerConnector createServerConnector(JettySettings jettySettings, int port, NetworkTrafficListener listener, ConnectionFactory... connectionFactories) {
         int acceptors = jettySettings.getAcceptors().or(2);
-        ServerConnector connector = new ServerConnector(
+        NetworkTrafficServerConnector connector = new NetworkTrafficServerConnector(
                 jettyServer,
                 null,
                 null,
@@ -224,6 +227,8 @@ class JettyHttpServer implements HttpServer {
 
         connector.setStopTimeout(0);
         connector.getSelectorManager().setStopTimeout(0);
+
+        connector.addNetworkTrafficListener(listener);
 
         setJettySettings(jettySettings, connector);
 
@@ -279,11 +284,67 @@ class JettyHttpServer implements HttpServer {
             Notifier notifier
     ) {
         ServletContextHandler adminContext = new ServletContextHandler(jettyServer, ADMIN_CONTEXT_ROOT);
+
+        adminContext.setInitParameter("org.eclipse.jetty.servlet.Default.maxCacheSize", "0");
+
+        String javaVendor = System.getProperty("java.vendor");
+        if (javaVendor != null && javaVendor.toLowerCase().contains("android")) {
+            //Special case for Android, fixes IllegalArgumentException("resource assets not found."):
+            //  The Android ClassLoader apparently does not resolve directories.
+            //  Furthermore, lib assets will be merged into a single asset directory when a jar file is assimilated into an apk.
+            //  As resources can be addressed like "assets/swagger-ui/index.html", a static path element will suffice.
+            adminContext.setInitParameter("org.eclipse.jetty.servlet.Default.resourceBase", "assets");
+        } else {
+            adminContext.setInitParameter("org.eclipse.jetty.servlet.Default.resourceBase", Resources.getResource("assets").toString());
+        }
+
+        Resources.getResource("assets/swagger-ui/index.html");
+
+        adminContext.setInitParameter("org.eclipse.jetty.servlet.Default.dirAllowed", "false");
+        adminContext.addServlet(DefaultServlet.class, "/swagger-ui/*");
+
         ServletHolder servletHolder = adminContext.addServlet(WireMockHandlerDispatchingServlet.class, "/");
         servletHolder.setInitParameter(RequestHandler.HANDLER_CLASS_KEY, AdminRequestHandler.class.getName());
         adminContext.setAttribute(AdminRequestHandler.class.getName(), adminRequestHandler);
         adminContext.setAttribute(Notifier.KEY, notifier);
+
+        FilterHolder filterHolder = new FilterHolder(CrossOriginFilter.class);
+        filterHolder.setInitParameters(ImmutableMap.of(
+            "chainPreflight", "false",
+            "allowedOrigins", "*",
+            "allowedHeaders", "X-Requested-With,Content-Type,Accept,Origin,Authorization",
+            "allowedMethods", "OPTIONS,GET,POST,PUT,PATCH,DELETE"));
+
+        adminContext.addFilter(filterHolder, "/*", EnumSet.of(DispatcherType.REQUEST));
+
         return adminContext;
     }
 
+    private static class NetworkTrafficListenerAdapter implements NetworkTrafficListener {
+        private final WiremockNetworkTrafficListener wiremockNetworkTrafficListener;
+
+        NetworkTrafficListenerAdapter(WiremockNetworkTrafficListener wiremockNetworkTrafficListener) {
+            this.wiremockNetworkTrafficListener = wiremockNetworkTrafficListener;
+        }
+
+        @Override
+        public void opened(Socket socket) {
+            wiremockNetworkTrafficListener.opened(socket);
+        }
+
+        @Override
+        public void incoming(Socket socket, ByteBuffer bytes) {
+            wiremockNetworkTrafficListener.incoming(socket, bytes);
+        }
+
+        @Override
+        public void outgoing(Socket socket, ByteBuffer bytes) {
+            wiremockNetworkTrafficListener.outgoing(socket, bytes);
+        }
+
+        @Override
+        public void closed(Socket socket) {
+            wiremockNetworkTrafficListener.closed(socket);
+        }
+    }
 }

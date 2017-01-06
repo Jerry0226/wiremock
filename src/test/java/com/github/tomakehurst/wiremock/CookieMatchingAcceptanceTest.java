@@ -23,7 +23,6 @@ import java.util.List;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static com.github.tomakehurst.wiremock.testsupport.TestHttpHeader.withHeader;
-import static com.google.common.collect.Iterables.getFirst;
 import static com.google.common.net.HttpHeaders.COOKIE;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.is;
@@ -88,6 +87,32 @@ public class CookieMatchingAcceptanceTest extends AcceptanceTestBase {
 
         WireMockResponse response =
             testClient.get("/very-bad/cookie", withHeader(COOKIE, "my_cookieyouwontfindthis;;sldfjskldjf%%"));
+
+        assertThat(response.statusCode(), is(404));
+    }
+
+    @Test
+    public void matchesWhenRequiredAbsentCookieIsAbsent() {
+        stubFor(get(urlEqualTo("/absent/cookie"))
+            .withCookie("not_this_cookie", absent())
+            .willReturn(aResponse().withStatus(200)));
+
+        WireMockResponse response =
+            testClient.get("/absent/cookie",
+                withHeader(COOKIE, "my_cookie=xxx-mycookievalue-xxx; my_other_cookie=exact-other-value; irrelevant_cookie=whatever"));
+
+        assertThat(response.statusCode(), is(200));
+    }
+
+    @Test
+    public void doesNotMatchWhenRequiredAbsentCookieIsPresent() {
+        stubFor(get(urlEqualTo("/absent/cookie"))
+            .withCookie("my_cookie", absent())
+            .willReturn(aResponse().withStatus(200)));
+
+        WireMockResponse response =
+            testClient.get("/absent/cookie",
+                withHeader(COOKIE, "my_cookie=xxx-mycookievalue-xxx; my_other_cookie=exact-other-value; irrelevant_cookie=whatever"));
 
         assertThat(response.statusCode(), is(404));
     }

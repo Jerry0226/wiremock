@@ -25,14 +25,9 @@ import com.google.common.collect.FluentIterable;
 import java.lang.reflect.Constructor;
 
 @JsonDeserialize(using = StringValuePatternJsonDeserializer.class)
-public abstract class StringValuePattern implements ValueMatcher<String> {
+public abstract class StringValuePattern implements NamedValueMatcher<String> {
 
-    public static final StringValuePattern ABSENT = new StringValuePattern(null) {
-        @Override
-        public MatchResult match(String value) {
-            return MatchResult.noMatch();
-        }
-    };
+    public static final AbsentPattern ABSENT = new AbsentPattern(null);
 
     protected final String expectedValue;
 

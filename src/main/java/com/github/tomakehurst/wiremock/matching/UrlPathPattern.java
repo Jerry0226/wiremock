@@ -25,7 +25,11 @@ public class UrlPathPattern extends UrlPattern {
 
     @Override
     public MatchResult match(String url) {
-        String path = URI.create(url).getPath();
+        if (url == null) {
+            return MatchResult.noMatch();
+        }
+
+        String path = URI.create(url).getRawPath();
         return super.match(path);
     }
 
